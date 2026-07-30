@@ -1,5 +1,6 @@
 services:
   inference-gate:
+    image: ghcr.io/scottcowan/inference-gate:latest
     build: .
     ports:
       - "11435:11435"
