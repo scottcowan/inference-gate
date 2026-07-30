@@ -26,16 +26,20 @@ A GPU-gating reverse proxy for local LLM servers. Sits in front of Ollama, vLLM,
 
 GPU state comes from `gpustat`. A process on the GPU that isn't in `IGNORED_GPU_PROCESSES` is an external consumer. When external consumers are present, `normal` and `low` priority requests get a `429`. `high` gets through unless utilization is also above the threshold. `realtime` always passes.
 
+When external consumer VRAM exceeds `EXTERNAL_VRAM_THRESHOLD_MB` (a game is running), inference-gate drains in-flight requests, kills the LLM server, and frees the VRAM. When the game exits and VRAM drops back below the threshold, it restarts the server automatically. All requests 429 during drain and while the server is down.
+
 ## Priority routing
 
 Set `X-Priority` on the request. Missing or unrecognised values are treated as `normal`.
 
-| `X-Priority` | Forwards when |
-|---|---|
-| `realtime` | Always |
-| `high` | No external consumers, or `gpu_utilization_pct <= HIGH_PRIORITY_UTIL_THRESHOLD` |
-| `normal` | No external consumers |
-| `low` | No external consumers |
+| `X-Priority` | Server up, GPU free | Server up, GPU busy | Draining / down |
+|---|---|---|---|
+| `realtime` | forward | forward | 429 |
+| `high` | forward | forward if util ≤ threshold | 429 |
+| `normal` | forward | 429 | 429 |
+| `low` | forward | 429 | 429 |
+
+`low` requests cannot trigger a model switch — they run on whatever is already loaded or get a 429.
 
 Refused requests get `429` with `Retry-After: 10`:
 
@@ -76,6 +80,9 @@ Point clients at `:11435` instead of your LLM server's port. Stop publishing the
 | `IGNORED_GPU_PROCESSES` | see below | Process names that own the GPU legitimately and never trigger backoff |
 | `HIGH_PRIORITY_UTIL_THRESHOLD` | `80` | Utilization % above which `high`-priority requests also back off |
 | `MODEL_LOAD_IMMUNITY_SECS` | `60` | Seconds to hold inference requests after a model switch is detected |
+| `EXTERNAL_VRAM_THRESHOLD_MB` | `500` | Total external consumer VRAM (MB) above which a game is considered active. Below this, background processes (dwm.exe, browsers, Discord) are ignored. |
+| `SERVER_PROCESS` | _(unset)_ | Process name to kill when a game is detected (e.g. `ollama`, `llama-server`). Only works when the proxy runs natively on the same machine as the LLM server — not from inside Docker on a Windows host. |
+| `SERVER_START_COMMAND` | _(unset)_ | Shell command to restart the LLM server after the game exits (e.g. `ollama serve`). Same native-only constraint as `SERVER_PROCESS`. |
 | `PULL_COMMAND` | _(unset)_ | Shell command used to pull a model for non-Ollama backends; `{model}` is substituted. When unset, `/api/pull` is forwarded to the upstream unchanged. |
 | `PULL_HOLD_TIMEOUT_SECS` | `300` | Seconds to hold inference requests waiting for a pull to finish before returning 503 |
 
@@ -111,9 +118,15 @@ Raw GPU state for external monitors or schedulers.
   "external_consumers": [
     { "name": "cyberpunk2077.exe", "mem_mb": 11200 }
   ],
-  "free": false
+  "free": false,
+  "server": {
+    "state": "draining",
+    "in_flight": 2
+  }
 }
 ```
+
+`server.state` is one of `running`, `draining`, `down`, or `starting`.
 
 ### `POST /api/pull`
 
@@ -146,9 +159,35 @@ Forwards any request to the upstream server over `GET`, `POST`, `DELETE`, `HEAD`
 - All requests (streaming and non-streaming) are held until any in-progress pull completes (up to `PULL_HOLD_TIMEOUT_SECS`; returns 503 on timeout).
 - When a model switch is detected, all requests are held for `MODEL_LOAD_IMMUNITY_SECS` before being forwarded to give the new model time to load.
 
-## Deployment
+## Gaming PC / Windows native setup
+
+For a gaming PC, run inference-gate natively alongside your LLM server. The Docker path works for GPU gating but `SERVER_PROCESS` and `SERVER_START_COMMAND` require the proxy to run on the same OS as the LLM server — they use `psutil` to kill and restart host processes, which doesn't work from inside a Docker container on a Windows host.
+
+```bash
+pip install inference-gate   # or: pip install -e . from the repo
+cp .env.example .env
+# edit .env
+uvicorn app.main:app --port 11435
+```
+
+Recommended `.env` for Ollama on Windows:
+
+```
+UPSTREAM_URL=http://localhost:11434
+SERVER_PROCESS=ollama
+SERVER_START_COMMAND=ollama serve
+EXTERNAL_VRAM_THRESHOLD_MB=2000
+```
+
+Run `setup-windows.ps1` once as Administrator to disable GPU hardware acceleration in browsers and Discord, reducing idle VRAM usage and letting you set a lower threshold.
+
+To run as a background service, use [NSSM](https://nssm.cc/) or register a scheduled task that starts `uvicorn app.main:app --port 11435` at login.
+
+## Deployment (Docker / Linux server)
 
 inference-gate needs GPU device access to read NVML via `gpustat` — not to run inference.
+
+> **Note:** `SERVER_PROCESS` and `SERVER_START_COMMAND` only work when inference-gate runs natively on the same machine as the LLM server. In Docker these settings have no effect.
 
 ```yaml
 services:
