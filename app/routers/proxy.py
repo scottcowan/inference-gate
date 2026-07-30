@@ -9,6 +9,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from ..priority import Priority, get_priority, should_allow
+from ..server import ServerManager
 
 router = APIRouter()
 
@@ -146,30 +147,41 @@ async def _release_after(event: asyncio.Event, secs: float) -> None:
 async def proxy(request: Request, path: str) -> Response:
     settings = request.app.state.settings
     priority = get_priority(request)
+    manager: ServerManager = request.app.state.server_manager
 
-    pull_ready: asyncio.Event = request.app.state.pull_ready
-    model_ready: asyncio.Event = request.app.state.model_ready
-    if not pull_ready.is_set() or not model_ready.is_set():
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(pull_ready.wait(), model_ready.wait()),
-                timeout=settings.pull_hold_timeout_secs,
-            )
-        except TimeoutError:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "timed out waiting for model pull to complete"},
-            )
-
-    body = await request.body()
-    if body:
-        if (resp := _check_model_change(request, body, priority)) is not None:
-            return resp
-
-    gpu = await request.app.state.gpu_query()
-    if not should_allow(
-        priority, gpu, settings.high_priority_util_threshold, settings.external_vram_threshold_mb
-    ):
+    # Server draining or down — 429 everything
+    if not await manager.acquire():
         return _make_429()
 
-    return await _forward(request, request.method, f"/{path}", body or None)
+    try:
+        pull_ready: asyncio.Event = request.app.state.pull_ready
+        model_ready: asyncio.Event = request.app.state.model_ready
+        if not pull_ready.is_set() or not model_ready.is_set():
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(pull_ready.wait(), model_ready.wait()),
+                    timeout=settings.pull_hold_timeout_secs,
+                )
+            except TimeoutError:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "timed out waiting for model pull to complete"},
+                )
+
+        body = await request.body()
+        if body:
+            if (resp := _check_model_change(request, body, priority)) is not None:
+                return resp
+
+        gpu = await request.app.state.gpu_query()
+        if not should_allow(
+            priority,
+            gpu,
+            settings.high_priority_util_threshold,
+            settings.external_vram_threshold_mb,
+        ):
+            return _make_429()
+
+        return await _forward(request, request.method, f"/{path}", body or None)
+    finally:
+        await manager.release()

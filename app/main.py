@@ -12,6 +12,7 @@ from .gpu import GpuState, query_gpu
 from .routers.proxy import router as proxy_router
 from .routers.pull import router as pull_router
 from .routers.stats import router as stats_router
+from .server import ServerManager, watch_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +58,15 @@ async def lifespan(app: FastAPI):
     app.state.model_ready = asyncio.Event()
     app.state.model_ready.set()  # starts ready — no pending model load
     app.state._release_task = None
+    app.state.server_manager = ServerManager(settings)
+    watcher = asyncio.create_task(watch_gpu(app))
     logger.info("inference-gate starting — upstream: %s", settings.upstream_url)
     yield
+    watcher.cancel()
+    try:
+        await watcher
+    except asyncio.CancelledError:
+        pass
     await app.state.http_client.aclose()
 
 

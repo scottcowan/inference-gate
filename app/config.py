@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     # before giving up with a 503
     pull_hold_timeout_secs: int = 300
 
+    # Process name to kill when GPU pressure is detected (e.g. "ollama", "llama-server").
+    # When unset, the server is marked down without killing anything.
+    server_process: str | None = None
+
+    # Shell command to restart the LLM server after a game exits.
+    # When unset, the server stays down until manually restarted.
+    # e.g. "ollama serve" or "llama-server --model /models/qwen2.5-7b.gguf"
+    server_start_command: str | None = None
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
     @field_validator("ignored_gpu_processes", mode="before")
