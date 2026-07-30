@@ -143,11 +143,34 @@ async def _release_after(event: asyncio.Event, secs: float) -> None:
     event.set()
 
 
+def _gate_status_response(manager: ServerManager, gpu, settings) -> Response:
+    """HEAD preflight: returns gate status without forwarding or counting as in-flight."""
+    server = manager.to_dict()
+    total_external_mb = sum(p.get("mem_mb", 0) for p in gpu.external_consumers)
+    accepting = manager.accepting()
+    gpu_free = total_external_mb <= settings.external_vram_threshold_mb
+    status = 200 if accepting and gpu_free else 429
+    return Response(
+        status_code=status,
+        headers={
+            "X-Server-State": server["state"],
+            "X-In-Flight": str(server["in_flight"]),
+            "X-GPU-Utilization": str(gpu.utilization_pct),
+            "X-External-VRAM-MB": str(total_external_mb),
+        },
+    )
+
+
 @router.api_route("/{path:path}", methods=["GET", "POST", "DELETE", "HEAD"])
 async def proxy(request: Request, path: str) -> Response:
     settings = request.app.state.settings
     priority = get_priority(request)
     manager: ServerManager = request.app.state.server_manager
+
+    # HEAD — gate status check, no forwarding, no in-flight tracking
+    if request.method == "HEAD":
+        gpu = await request.app.state.gpu_query()
+        return _gate_status_response(manager, gpu, settings)
 
     # Server draining or down — 429 everything
     if not await manager.acquire():
