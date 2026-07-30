@@ -1,4 +1,5 @@
 """Tests for app/routers/proxy.py."""
+
 from __future__ import annotations
 
 import asyncio
@@ -26,6 +27,7 @@ def _async_gpu(state: GpuState):
 @pytest.fixture(autouse=True)
 def setup_settings():
     from app.config import get_settings
+
     get_settings.cache_clear()
     app.state.settings = get_settings()
 

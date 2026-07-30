@@ -30,7 +30,16 @@ async def _run_pull(request: Request, model: str, command: str):
         if proc.returncode == 0:
             yield json.dumps({"status": "done", "done": True}).encode() + b"\n"
         else:
-            yield json.dumps({"status": f"pull failed (exit {proc.returncode})", "done": False, "error": True}).encode() + b"\n"
+            yield (
+                json.dumps(
+                    {
+                        "status": f"pull failed (exit {proc.returncode})",
+                        "done": False,
+                        "error": True,
+                    }
+                ).encode()
+                + b"\n"
+            )
     finally:
         pull_ready.set()  # release held inference requests
 
@@ -42,6 +51,7 @@ async def pull(request: Request) -> StreamingResponse | JSONResponse:
     # No pull_command configured — pass through to upstream like any other request.
     if not settings.pull_command:
         from .proxy import _forward
+
         body = await request.body()
         return await _forward(request, "POST", "/api/pull", body or None)
 

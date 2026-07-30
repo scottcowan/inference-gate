@@ -70,6 +70,6 @@ async def health():
     return {"status": "ok", "version": "0.1.0"}
 
 
-app.include_router(stats_router)   # GET /gpu
-app.include_router(pull_router)    # POST /api/pull — before catch-all
-app.include_router(proxy_router)   # catch-all — must be last
+app.include_router(stats_router)  # GET /gpu
+app.include_router(pull_router)  # POST /api/pull — before catch-all
+app.include_router(proxy_router)  # catch-all — must be last

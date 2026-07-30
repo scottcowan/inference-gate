@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     # gpu_utilization_pct threshold above which even high-priority requests back off
     high_priority_util_threshold: int = 80
 
+    # total VRAM used by external consumers (MB) below which the GPU is still treated as free.
+    # Handles background Windows processes (dwm.exe, browser GPU processes, Discord, etc.)
+    # that always hold a small amount of VRAM. Default 500 MB.
+    external_vram_threshold_mb: int = 500
+
     # seconds to treat GPU as free after a model change is detected
     model_load_immunity_secs: int = 60
 

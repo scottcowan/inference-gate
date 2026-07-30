@@ -8,7 +8,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from ..priority import get_priority, should_allow
+from ..priority import Priority, get_priority, should_allow
 
 router = APIRouter()
 
@@ -104,27 +104,37 @@ async def _forward(request: Request, method: str, path: str, body: bytes | None)
     )
 
 
-def _check_model_change(request: Request, body: bytes) -> None:
-    """On a model switch, hold subsequent requests until the load window expires."""
+def _check_model_change(request: Request, body: bytes, priority: Priority) -> JSONResponse | None:
+    """On a model switch, hold subsequent requests until the load window expires.
+
+    Low-priority requests are rejected with 429 rather than triggering a model load —
+    they run on whatever model is already loaded or not at all.
+    """
     try:
         parsed = json.loads(body)
         model = parsed.get("model") if isinstance(parsed, dict) else None
     except (ValueError, AttributeError):
-        return
+        return None
     if not model or model == request.app.state.last_model:
-        return
+        return None
     prev = request.app.state.last_model
+    if priority == Priority.LOW:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "low-priority requests cannot switch models"},
+            headers={"Retry-After": RETRY_AFTER},
+        )
     request.app.state.last_model = model
     if prev is None:
-        return  # first request — no load needed
+        return None  # first request — no load needed
     secs = request.app.state.settings.model_load_immunity_secs
     model_ready: asyncio.Event = request.app.state.model_ready
-    # Cancel any stale _release_after task before starting a new window
     old_task = request.app.state._release_task
     if old_task and not old_task.done():
         old_task.cancel()
     model_ready.clear()
     request.app.state._release_task = asyncio.ensure_future(_release_after(model_ready, secs))
+    return None
 
 
 async def _release_after(event: asyncio.Event, secs: float) -> None:
@@ -153,10 +163,13 @@ async def proxy(request: Request, path: str) -> Response:
 
     body = await request.body()
     if body:
-        _check_model_change(request, body)
+        if (resp := _check_model_change(request, body, priority)) is not None:
+            return resp
 
     gpu = await request.app.state.gpu_query()
-    if not should_allow(priority, gpu, settings.high_priority_util_threshold):
+    if not should_allow(
+        priority, gpu, settings.high_priority_util_threshold, settings.external_vram_threshold_mb
+    ):
         return _make_429()
 
     return await _forward(request, request.method, f"/{path}", body or None)

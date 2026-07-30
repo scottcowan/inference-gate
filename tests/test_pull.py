@@ -1,4 +1,5 @@
 """Tests for app/routers/pull.py."""
+
 from __future__ import annotations
 
 import asyncio
@@ -26,6 +27,7 @@ def _async_gpu(state: GpuState):
 @pytest.fixture(autouse=True)
 def setup_settings():
     from app.config import get_settings
+
     get_settings.cache_clear()
     app.state.settings = get_settings()
 
@@ -119,8 +121,8 @@ def test_pull_clears_pull_ready_during_run():
     mid_event = asyncio.Event()
 
     async def _readline_gen():
-        start_event.set()          # signal that pull started
-        await mid_event.wait()     # pause mid-stream
+        start_event.set()  # signal that pull started
+        await mid_event.wait()  # pause mid-stream
         yield b"line\n"
 
     stdout = MagicMock()
@@ -155,6 +157,7 @@ def test_pull_clears_pull_ready_during_run():
 
             # Wait until the generator has cleared pull_ready and is paused mid-stream.
             import time
+
             deadline = time.monotonic() + 2.0
             while not start_event.is_set():
                 time.sleep(0.005)
