@@ -1,0 +1,31 @@
+services:
+  ollama-gpu-proxy:
+    build: .
+    ports:
+      - "11435:11435"   # priority-gated Ollama proxy
+      - "9500:9500"     # raw GPU stats endpoint
+    environment:
+      - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434}
+      - HIGH_PRIORITY_UTIL_THRESHOLD=${HIGH_PRIORITY_UTIL_THRESHOLD:-80}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # Reference — attach to existing Ollama container network in prod.
+  # Uncomment for standalone dev testing:
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   ports:
+  #     - "11434:11434"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
