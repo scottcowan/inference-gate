@@ -1,9 +1,11 @@
-from enum import Enum
+from enum import StrEnum
+
 from fastapi import Request
+
 from .gpu import GpuState
 
 
-class Priority(str, Enum):
+class Priority(StrEnum):
     REALTIME = "realtime"
     HIGH = "high"
     NORMAL = "normal"

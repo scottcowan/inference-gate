@@ -22,37 +22,38 @@ def _make_429() -> JSONResponse:
 
 async def _forward(request: Request, method: str, path: str, body: bytes | None) -> Response:
     settings = request.app.state.settings
+    client: httpx.AsyncClient = request.app.state.http_client
     url = f"{settings.ollama_url}{path}"
 
     headers = {
-        k: v for k, v in request.headers.items()
+        k: v
+        for k, v in request.headers.items()
         if k.lower() not in ("host", "content-length", "x-priority")
     }
 
     is_streaming = False
     if body:
         import json
+
         try:
             parsed = json.loads(body)
-            is_streaming = bool(parsed.get("stream", False))
-        except (ValueError, KeyError):
+            if isinstance(parsed, dict):
+                is_streaming = bool(parsed.get("stream", False))
+        except ValueError:
             pass
 
     if is_streaming:
+
         async def _stream():
-            async with httpx.AsyncClient() as client:
-                async with client.stream(
-                    method, url, content=body, headers=headers, timeout=None
-                ) as upstream:
-                    async for chunk in upstream.aiter_bytes():
-                        yield chunk
+            async with client.stream(
+                method, url, content=body, headers=headers, timeout=None
+            ) as upstream:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
 
         return StreamingResponse(_stream(), media_type="application/x-ndjson")
 
-    async with httpx.AsyncClient() as client:
-        upstream = await client.request(
-            method, url, content=body, headers=headers, timeout=120
-        )
+    upstream = await client.request(method, url, content=body, headers=headers)
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
@@ -64,7 +65,7 @@ async def _forward(request: Request, method: str, path: str, body: bytes | None)
 async def proxy(request: Request, path: str) -> Response:
     settings = request.app.state.settings
     priority = get_priority(request)
-    gpu = request.app.state.gpu_query()
+    gpu = await request.app.state.gpu_query()
 
     if not should_allow(priority, gpu, settings.high_priority_util_threshold):
         return _make_429()

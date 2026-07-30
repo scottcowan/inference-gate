@@ -1,11 +1,12 @@
-import pytest
 from app.gpu import GpuState
 from app.priority import Priority, should_allow
 
 FREE = GpuState(0, 0, 16376, 0.0, [], True)
-LIGHT = GpuState(30, 4000, 16376, 24.4, [], True)   # docker only, still free
+LIGHT = GpuState(30, 4000, 16376, 24.4, [], True)  # docker only, still free
 BUSY = GpuState(94, 12000, 16376, 73.3, [{"name": "cyberpunk2077.exe", "mem_mb": 11200}], False)
-VERY_BUSY = GpuState(95, 14000, 16376, 85.4, [{"name": "cyberpunk2077.exe", "mem_mb": 13000}], False)
+VERY_BUSY = GpuState(
+    95, 14000, 16376, 85.4, [{"name": "cyberpunk2077.exe", "mem_mb": 13000}], False
+)
 
 HIGH_THRESHOLD = 80
 

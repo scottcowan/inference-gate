@@ -2,11 +2,13 @@ services:
   ollama-gpu-proxy:
     build: .
     ports:
-      - "11435:11435"   # priority-gated Ollama proxy
-      - "9500:9500"     # raw GPU stats endpoint
+      - "11435:11435"   # priority-gated Ollama proxy + /gpu stats on same port
+    pid: host           # required so gpustat can see host process names
     environment:
       - OLLAMA_URL=${OLLAMA_URL:-http://ollama:11434}
       - HIGH_PRIORITY_UTIL_THRESHOLD=${HIGH_PRIORITY_UTIL_THRESHOLD:-80}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=utility,compute
     deploy:
       resources:
         reservations:

@@ -27,15 +27,17 @@ class GpuState:
 def query_gpu(ignored_processes: list[str]) -> GpuState:
     try:
         from gpustat import GPUStatCollection
+
         stats = GPUStatCollection.new_query()
         gpu = stats[0]
 
         ignored = {p.lower() for p in ignored_processes}
         external = []
         for p in gpu.processes:
-            name = (p.full_command or p.username or "").split("/")[-1].split("\\")[-1].lower()
+            raw = p.get("command") or p.get("full_command") or p.get("username") or ""
+            name = raw.split("/")[-1].split("\\")[-1].lower()
             if name not in ignored:
-                external.append({"name": name, "mem_mb": p.gpu_memory_usage})
+                external.append({"name": name, "mem_mb": p.get("gpu_memory_usage", 0)})
 
         mem_total = gpu.memory_total or 1
         return GpuState(
