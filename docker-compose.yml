@@ -15,17 +15,3 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
-
-  # Reference — attach to existing Ollama container network in prod.
-  # Uncomment for standalone dev testing:
-  # ollama:
-  #   image: ollama/ollama:latest
-  #   ports:
-  #     - "11434:11434"
-  #   deploy:
-  #     resources:
-  #       reservations:
-  #         devices:
-  #           - driver: nvidia
-  #             count: all
-  #             capabilities: [gpu]
