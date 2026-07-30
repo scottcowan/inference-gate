@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import json
+from collections.abc import AsyncIterator
+
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -23,7 +27,7 @@ def _make_429() -> JSONResponse:
 async def _forward(request: Request, method: str, path: str, body: bytes | None) -> Response:
     settings = request.app.state.settings
     client: httpx.AsyncClient = request.app.state.http_client
-    url = f"{settings.ollama_url}{path}"
+    url = f"{settings.upstream_url}{path}"
 
     headers = {
         k: v
@@ -33,8 +37,6 @@ async def _forward(request: Request, method: str, path: str, body: bytes | None)
 
     is_streaming = False
     if body:
-        import json
-
         try:
             parsed = json.loads(body)
             if isinstance(parsed, dict):
@@ -43,15 +45,56 @@ async def _forward(request: Request, method: str, path: str, body: bytes | None)
             pass
 
     if is_streaming:
+        _ct: list[str] = []
+        _queue: asyncio.Queue[bytes | BaseException | None] = asyncio.Queue()
 
-        async def _stream():
-            async with client.stream(
-                method, url, content=body, headers=headers, timeout=None
-            ) as upstream:
-                async for chunk in upstream.aiter_bytes():
+        async def _produce() -> None:
+            _headers_sent = False
+            try:
+                async with client.stream(
+                    method, url, content=body, headers=headers, timeout=None
+                ) as upstream:
+                    _ct.append(upstream.headers.get("content-type", "application/octet-stream"))
+                    _queue.put_nowait(None)  # headers-ready signal
+                    _headers_sent = True
+                    async for chunk in upstream.aiter_bytes():
+                        await _queue.put(chunk)
+                await _queue.put(b"")  # end sentinel
+            except BaseException as exc:
+                if not _headers_sent:
+                    _ct.append("application/octet-stream")
+                    _queue.put_nowait(None)
+                await _queue.put(exc)
+
+        task = asyncio.create_task(_produce())
+        await _queue.get()  # wait until upstream headers are known
+        content_type = _ct[0] if _ct else "application/octet-stream"
+
+        async def _consume() -> AsyncIterator[bytes]:
+            while True:
+                item = await _queue.get()
+                if item == b"":
+                    break
+                if item is None:
+                    raise RuntimeError("unexpected None in streaming queue")
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+            await task
+
+        async def _stream_with_cleanup() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in _consume():
                     yield chunk
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
-        return StreamingResponse(_stream(), media_type="application/x-ndjson")
+        return StreamingResponse(_stream_with_cleanup(), media_type=content_type)
 
     upstream = await client.request(method, url, content=body, headers=headers)
     return Response(
@@ -61,14 +104,59 @@ async def _forward(request: Request, method: str, path: str, body: bytes | None)
     )
 
 
+def _check_model_change(request: Request, body: bytes) -> None:
+    """On a model switch, hold subsequent requests until the load window expires."""
+    try:
+        parsed = json.loads(body)
+        model = parsed.get("model") if isinstance(parsed, dict) else None
+    except (ValueError, AttributeError):
+        return
+    if not model or model == request.app.state.last_model:
+        return
+    prev = request.app.state.last_model
+    request.app.state.last_model = model
+    if prev is None:
+        return  # first request — no load needed
+    secs = request.app.state.settings.model_load_immunity_secs
+    model_ready: asyncio.Event = request.app.state.model_ready
+    # Cancel any stale _release_after task before starting a new window
+    old_task = request.app.state._release_task
+    if old_task and not old_task.done():
+        old_task.cancel()
+    model_ready.clear()
+    request.app.state._release_task = asyncio.ensure_future(_release_after(model_ready, secs))
+
+
+async def _release_after(event: asyncio.Event, secs: float) -> None:
+    await asyncio.sleep(secs)
+    event.set()
+
+
 @router.api_route("/{path:path}", methods=["GET", "POST", "DELETE", "HEAD"])
 async def proxy(request: Request, path: str) -> Response:
     settings = request.app.state.settings
     priority = get_priority(request)
-    gpu = await request.app.state.gpu_query()
 
+    pull_ready: asyncio.Event = request.app.state.pull_ready
+    model_ready: asyncio.Event = request.app.state.model_ready
+    if not pull_ready.is_set() or not model_ready.is_set():
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(pull_ready.wait(), model_ready.wait()),
+                timeout=settings.pull_hold_timeout_secs,
+            )
+        except TimeoutError:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "timed out waiting for model pull to complete"},
+            )
+
+    body = await request.body()
+    if body:
+        _check_model_change(request, body)
+
+    gpu = await request.app.state.gpu_query()
     if not should_allow(priority, gpu, settings.high_priority_util_threshold):
         return _make_429()
 
-    body = await request.body()
     return await _forward(request, request.method, f"/{path}", body or None)

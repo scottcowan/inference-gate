@@ -1,49 +1,43 @@
-# ollama-gpu-proxy
+# inference-gate
 
-A priority-gated reverse proxy for Ollama. It sits in front of an Ollama instance and decides, per request, whether the GPU is free enough to serve it. When something *else* is using the GPU — a game, a Jupyter kernel, Stable Diffusion — low-priority background inference gets a `429` with `Retry-After` instead of fighting for VRAM, while realtime requests always pass through. GPU consumers are detected with `gpustat`; Docker-owned processes (i.e. Ollama itself) are ignored, so the proxy never backs off because of its own upstream.
+A GPU-gating reverse proxy for local LLM servers. Sits in front of Ollama, vLLM, LM Studio, llama.cpp, or any compatible server and blocks inference requests when something else owns the GPU — a game, a video editor, a render job. Realtime requests always pass through. Everything else waits.
 
-## Architecture
+## How it works
 
 ```
-  interactive client            batch / pipeline client
-  X-Priority: realtime          X-Priority: low
-          │                              │
-          └──────────────┬───────────────┘
+  client (X-Priority: realtime)     client (X-Priority: low)
+          │                                   │
+          └──────────────┬────────────────────┘
                          ▼
-              ┌──────────────────────┐
-              │  ollama-gpu-proxy    │      ┌──────────────┐
-              │  :11435              │─────▶│   gpustat    │
-              │                      │◀─────│  (NVML)      │
-              │  GET  /health        │      └──────────────┘
-              │  GET  /gpu           │              │
-              │  *    /{path}  ──────┼──┐     reads GPU util +
-              └──────────────────────┘  │     process list, filters
-                         │              │     out docker/dockerd
-              429 + Retry-After         │
-              (GPU busy, priority       │  forward
-               too low)                 ▼
-                                ┌──────────────┐
-                                │    Ollama    │
-                                │    :11434    │
-                                └──────────────┘
-                                       │
-                                    [ GPU ]  ◀── also: games, Jupyter, SD
+              ┌─────────────────────┐
+              │   inference-gate    │ ◀──── gpustat (NVML)
+              │   :11435            │       reads GPU util +
+              │                     │       process list
+              └──────┬──────────────┘
+                     │ allow / 429
+                     ▼
+              ┌─────────────────────┐
+              │   LLM Server        │
+              │   :11434            │
+              └─────────────────────┘
+                     │
+                  [ GPU ] ◀── also: games, Blender, SD
 ```
+
+GPU state comes from `gpustat`. A process on the GPU that isn't in `IGNORED_GPU_PROCESSES` is an external consumer. When external consumers are present, `normal` and `low` priority requests get a `429`. `high` gets through unless utilization is also above the threshold. `realtime` always passes.
 
 ## Priority routing
 
-Priority comes from the `X-Priority` request header. Missing or unrecognised values are treated as `normal`.
+Set `X-Priority` on the request. Missing or unrecognised values are treated as `normal`.
 
-| `X-Priority` | Forwarded when |
+| `X-Priority` | Forwards when |
 |---|---|
-| `realtime` | Always — never gated |
-| `high` | GPU is free, **or** `gpu_utilization_pct <= HIGH_PRIORITY_UTIL_THRESHOLD` |
-| `normal` | GPU is free (zero external consumers) |
-| `low` | GPU is free (zero external consumers) |
+| `realtime` | Always |
+| `high` | No external consumers, or `gpu_utilization_pct <= HIGH_PRIORITY_UTIL_THRESHOLD` |
+| `normal` | No external consumers |
+| `low` | No external consumers |
 
-"Free" means no external GPU consumers — every process on the GPU matched `IGNORED_GPU_PROCESSES`. GPU utilization alone does not make the GPU busy; a single external process does.
-
-When a request is refused the proxy returns `429` with `Retry-After: 10`:
+Refused requests get `429` with `Retry-After: 10`:
 
 ```json
 { "error": "GPU busy — retry after GPU is free" }
@@ -53,28 +47,48 @@ When a request is refused the proxy returns `429` with `Retry-After: 10`:
 
 ```bash
 cp .env.example .env
+# set UPSTREAM_URL to your LLM server
 docker compose up -d --build
 
 curl localhost:11435/health
 curl localhost:11435/gpu
 
+# Ollama
 curl localhost:11435/api/generate \
   -H 'X-Priority: low' \
   -d '{"model":"qwen2.5:7b","prompt":"hello"}'
+
+# OpenAI-compatible (vLLM, LM Studio, llama.cpp, etc.)
+curl localhost:11435/v1/chat/completions \
+  -H 'X-Priority: low' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen2.5:7b","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-The compose file assumes an `ollama` container is reachable on the same network. For standalone testing, uncomment the `ollama` service block in `docker-compose.yml`.
+Point clients at `:11435` instead of your LLM server's port. Stop publishing the LLM server's own port if you want the gate to be unbypassable.
 
 ## Configuration
 
-Environment variables (or a `.env` file), read by `app/config.py`:
-
 | Variable | Default | Purpose |
 |---|---|---|
-| `OLLAMA_URL` | `http://ollama:11434` | Upstream Ollama base URL |
-| `PROXY_PORT` | `11435` | Documented listen port (the actual bind is the `uvicorn --port` flag in the Dockerfile `CMD`) |
-| `IGNORED_GPU_PROCESSES` | `docker dockerd com.docker.backend ollama ollama_llama_server` | Process names that never count as external consumers. Accepts a JSON array or a space-separated string |
-| `HIGH_PRIORITY_UTIL_THRESHOLD` | `80` | Utilization percentage above which `high`-priority requests also back off |
+| `UPSTREAM_URL` | `http://localhost:11434` | LLM server base URL |
+| `PROXY_PORT` | `11435` | Informational only — changing this value alone has no effect. You must also update the `uvicorn --port` flag in the Dockerfile `CMD` and the `ports` mapping in your compose file. |
+| `IGNORED_GPU_PROCESSES` | see below | Process names that own the GPU legitimately and never trigger backoff |
+| `HIGH_PRIORITY_UTIL_THRESHOLD` | `80` | Utilization % above which `high`-priority requests also back off |
+| `MODEL_LOAD_IMMUNITY_SECS` | `60` | Seconds to hold inference requests after a model switch is detected |
+| `PULL_COMMAND` | _(unset)_ | Shell command used to pull a model for non-Ollama backends; `{model}` is substituted. When unset, `/api/pull` is forwarded to the upstream unchanged. |
+| `PULL_HOLD_TIMEOUT_SECS` | `300` | Seconds to hold inference requests waiting for a pull to finish before returning 503 |
+
+Default `IGNORED_GPU_PROCESSES`: `ollama ollama_llama_server llama-server llamafile lmstudio lms koboldcpp cortex-cpp nitro python python3`
+
+Add your server's process name if it isn't there. For Docker-based Ollama, add `docker dockerd com.docker.backend`. Games (`cs2.exe`, `eldenring.exe`, `DaVinciResolve.exe`) should never be in this list — they're the reason the gate exists.
+
+Accepts a JSON array or space-separated string:
+
+```
+IGNORED_GPU_PROCESSES=ollama llama-server python3
+IGNORED_GPU_PROCESSES=["ollama","llama-server","python3"]
+```
 
 ## API
 
@@ -86,7 +100,7 @@ Environment variables (or a `.env` file), read by `app/config.py`:
 
 ### `GET /gpu`
 
-Raw GPU state, for external monitors and schedulers that want to make their own admission decisions.
+Raw GPU state for external monitors or schedulers.
 
 ```json
 {
@@ -101,45 +115,55 @@ Raw GPU state, for external monitors and schedulers that want to make their own 
 }
 ```
 
+### `POST /api/pull`
+
+Behaviour depends on whether `PULL_COMMAND` is set.
+
+- **`PULL_COMMAND` unset (default):** the request is forwarded to the upstream unchanged (standard Ollama pull passthrough).
+- **`PULL_COMMAND` set:** inference-gate runs the command locally, substituting `{model}` with the model name from the request body (`{"model": "<name>"}`). It streams NDJSON progress lines:
+
+  ```json
+  {"status": "pulling manifest", "done": false}
+  {"status": "downloading ...", "done": false}
+  {"status": "done", "done": true}
+  ```
+
+  While the pull is running, all inference requests are held via the `pull_ready` gate. Requests that wait longer than `PULL_HOLD_TIMEOUT_SECS` receive a 503.
+
+  Example `PULL_COMMAND` for Hugging Face:
+
+  ```
+  PULL_COMMAND=huggingface-cli download {model}
+  ```
+
 ### `ANY /{path}`
 
-Catch-all proxy for every Ollama route (`/api/generate`, `/api/chat`, `/api/tags`, …) over `GET`, `POST`, `DELETE`, `HEAD`. Behaviour:
+Forwards any request to the upstream server over `GET`, `POST`, `DELETE`, `HEAD`.
 
-- Gated by `X-Priority` per the table above.
 - `Host`, `Content-Length`, and `X-Priority` are stripped; all other headers pass through.
-- Requests with `"stream": true` in the JSON body are proxied as a streaming `application/x-ndjson` response with no timeout. Non-streaming requests use a 120s timeout.
+- Requests with `"stream": true` in the JSON body are streamed with no timeout, passing through the upstream's `Content-Type` (`application/x-ndjson` for Ollama native routes, `text/event-stream` for OpenAI-compatible routes).
+- Non-streaming requests use a 120s timeout.
+- All requests (streaming and non-streaming) are held until any in-progress pull completes (up to `PULL_HOLD_TIMEOUT_SECS`; returns 503 on timeout).
+- When a model switch is detected, all requests are held for `MODEL_LOAD_IMMUNITY_SECS` before being forwarded to give the new model time to load.
 
 ## Deployment
 
-Runs as a sidecar next to the Ollama container. It needs GPU device access of its own — not to run inference, but so `gpustat` can read NVML from inside the container.
-
-Add to an existing Ollama compose stack:
+inference-gate needs GPU device access to read NVML via `gpustat` — not to run inference.
 
 ```yaml
 services:
-  ollama:
-    image: ollama/ollama:latest
-    # no host port needed — only the proxy needs to reach it
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  ollama-gpu-proxy:
-    build: ./ollama-gpu-proxy
+  inference-gate:
+    build: .
     ports:
       - "11435:11435"
     pid: host           # required so gpustat can see host process names
     environment:
-      - OLLAMA_URL=http://ollama:11434
+      - UPSTREAM_URL=http://llm-server:11434   # replace with your LLM server's service name / address
       - HIGH_PRIORITY_UTIL_THRESHOLD=80
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=utility,compute
-    depends_on:
-      - ollama
+    # depends_on:
+    #   - llm-server   # uncomment and set to your LLM service name if it runs in the same compose file
     deploy:
       resources:
         reservations:
@@ -150,23 +174,17 @@ services:
     restart: unless-stopped
 ```
 
-Then point clients at `:11435` instead of `:11434`. Stop publishing Ollama's own port to the host if you want the gate to be unbypassable.
-
-If `gpustat` cannot reach a GPU — no NVIDIA runtime, dev laptop — the query logs a warning and reports the GPU as **free**, so local development is never blocked. This fail-open behaviour means a broken NVML setup in production silently disables gating; check `/gpu` after deploying to confirm real numbers are coming back.
+If `gpustat` can't reach a GPU (no NVIDIA runtime, dev laptop), it logs a warning and reports the GPU as free. The proxy never blocks in that state. Check `/gpu` after deploying to confirm real numbers.
 
 ## Development
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e '.[dev]'
-
-pytest                      # full suite
-pytest tests/test_priority.py -v
+pytest
 ```
 
-`tests/test_priority.py` covers the admission matrix as pure functions. `tests/test_proxy.py` drives the app through `TestClient`, stubbing `app.state.gpu_query` with fixed `GpuState` values and mocking the upstream with `respx` — no GPU or Ollama instance required. `tests/test_gpu.py` covers the gpustat dict-format parsing, ignored-process filtering, and the `IGNORED_GPU_PROCESSES` env validator.
-
-To run the app directly:
+Tests stub `app.state.gpu_query` with fixed `GpuState` values and mock the upstream with `respx` — no GPU or LLM server needed.
 
 ```bash
 uvicorn app.main:app --reload --port 11435

@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from .config import get_settings
 from .gpu import GpuState, query_gpu
 from .routers.proxy import router as proxy_router
+from .routers.pull import router as pull_router
 from .routers.stats import router as stats_router
 
 logger = logging.getLogger(__name__)
@@ -50,12 +51,18 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.gpu_query = _make_gpu_query(settings)
     app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0))
-    logger.info("ollama-gpu-proxy starting — upstream: %s", settings.ollama_url)
+    app.state.last_model = None
+    app.state.pull_ready = asyncio.Event()
+    app.state.pull_ready.set()  # starts ready — not pulling
+    app.state.model_ready = asyncio.Event()
+    app.state.model_ready.set()  # starts ready — no pending model load
+    app.state._release_task = None
+    logger.info("inference-gate starting — upstream: %s", settings.upstream_url)
     yield
     await app.state.http_client.aclose()
 
 
-app = FastAPI(title="ollama-gpu-proxy", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="inference-gate", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -63,5 +70,6 @@ async def health():
     return {"status": "ok", "version": "0.1.0"}
 
 
-app.include_router(stats_router)  # GET /gpu  (stats endpoint)
-app.include_router(proxy_router)  # catch-all — must be last
+app.include_router(stats_router)   # GET /gpu
+app.include_router(pull_router)    # POST /api/pull — before catch-all
+app.include_router(proxy_router)   # catch-all — must be last
