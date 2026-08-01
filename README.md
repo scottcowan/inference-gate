@@ -28,6 +28,23 @@ GPU state comes from `gpustat`. A process on the GPU that isn't in `IGNORED_GPU_
 
 When external consumer VRAM exceeds `EXTERNAL_VRAM_THRESHOLD_MB` (a game is running), inference-gate drains in-flight requests, kills the LLM server, and frees the VRAM. When the game exits and VRAM drops back below the threshold, it restarts the server automatically. All requests 429 during drain and while the server is down.
 
+On Windows, NVML often reports mem_mb: 0 under WDDM. inference-gate fills dedicated VRAM from Windows Performance Counters (PDH `GPU Process Memory(*)\Dedicated Usage`, same counter family as Task Manager, ~2ms/sample) so processes appear in `/gpu` with `mem_source: "pdh"`.
+
+**Finding:** PDH dedicated-usage MB is unreliable for games. Watch Dogs showed ~22 MB on PDH while needing GBs; treating that as under `EXTERNAL_VRAM_THRESHOLD_MB` left the LLM loaded and fullscreen crashed. DWM can also show inflated PDH values (GBs) — filtered via the desktop-process allowlist. So on Windows, any non-desktop GPU process with PDH (or zero) VRAM counts as **busy by presence**; the VRAM threshold applies only to trustworthy NVML-style numbers (typical on Linux).
+
+**Also:** API unload alone is not equivalent to stopping a Docker Ollama container.
+Prefer soft-stop of Ollama when a non-desktop GPU process appears (`SERVER_KILL_PROCESSES=true`,
+`SERVER_FORCE_KILL=false`). Hard-kill of CUDA runners can wedge WDDM so exclusive
+fullscreen keeps crashing until reboot. Detection is GPU-based only: a hardcoded
+desktop allowlist in `app/windows_gpu.py` (browsers, Steam/Epic/EA/Battle.net/GOG
+helpers, Razer, Signal, PowerToys, …) filters idle noise; everything else on the
+GPU is treated as a real workload. No per-game name lists. The gate re-opens after
+`SERVER_RESTART_STABLE_SECS` of continuous free time, restarts the LLM, optionally
+preloads remembered models while still returning 429 (`STARTING`), then goes `running`.
+
+`IGNORED_GPU_PROCESSES` is only for the LLM server binaries themselves (Ollama, vLLM,
+llama-server, …). Launchers belong on the desktop allowlist (or should not autostart).
+
 ## Priority routing
 
 Set `X-Priority` on the request. Missing or unrecognised values are treated as `normal`.
@@ -49,11 +66,17 @@ Refused requests get `429` with `Retry-After: 10`:
 
 ## Quick start
 
-```bash
-cp .env.example .env
-# set UPSTREAM_URL to your LLM server
-docker compose up -d --build
+Run natively on the same machine as the LLM server (required for soft-stop / restart):
 
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\Activate.ps1
+pip install -e .
+cp .env.example .env
+# edit .env — see recommended Windows block below
+uvicorn app.main:app --host 0.0.0.0 --port 11435
+```
+
+```bash
 curl localhost:11435/health
 curl localhost:11435/gpu
 
@@ -76,24 +99,30 @@ Point clients at `:11435` instead of your LLM server's port. Stop publishing the
 | Variable | Default | Purpose |
 |---|---|---|
 | `UPSTREAM_URL` | `http://localhost:11434` | LLM server base URL |
-| `PROXY_PORT` | `11435` | Informational only — changing this value alone has no effect. You must also update the `uvicorn --port` flag in the Dockerfile `CMD` and the `ports` mapping in your compose file. |
-| `IGNORED_GPU_PROCESSES` | see below | Process names that own the GPU legitimately and never trigger backoff |
+| `PROXY_PORT` | `11435` | Informational only — the listen port is set by `uvicorn --port` (or `scripts/start-gate.ps1`). |
+| `IGNORED_GPU_PROCESSES` | see below | LLM server process names that own the GPU legitimately and never trigger backoff (not launchers) |
 | `HIGH_PRIORITY_UTIL_THRESHOLD` | `80` | Utilization % above which `high`-priority requests also back off |
 | `MODEL_LOAD_IMMUNITY_SECS` | `60` | Seconds to hold inference requests after a model switch is detected |
-| `EXTERNAL_VRAM_THRESHOLD_MB` | `500` | Total external consumer VRAM (MB) above which a game is considered active. Below this, background processes (dwm.exe, browsers, Discord) are ignored. |
-| `SERVER_PROCESS` | _(unset)_ | Process name to kill when a game is detected (e.g. `ollama`, `llama-server`). Only works when the proxy runs natively on the same machine as the LLM server — not from inside Docker on a Windows host. |
-| `SERVER_START_COMMAND` | _(unset)_ | Shell command to restart the LLM server after the game exits (e.g. `ollama serve`). Same native-only constraint as `SERVER_PROCESS`. |
+| `EXTERNAL_VRAM_THRESHOLD_MB` | `500` | Total external consumer VRAM (MB) above which a game is considered active when figures are trustworthy (NVML). On Windows PDH, non-desktop process presence is primary. |
+| `EXTERNAL_UTIL_FALLBACK_THRESHOLD` | `40` | Secondary util busy signal when per-process VRAM is missing. On Windows, PDH + non-desktop presence are preferred. |
+| `SERVER_RESTART_STABLE_SECS` | `5` | Seconds the GPU must stay free before restarting the LLM server after a drain (stops util-dip thrashing while a game loads). |
+| `SERVER_PROCESS` | _(unset)_ | Process name to stop when a game is detected (e.g. `ollama`, `llama-server`). Must run on the same OS as the LLM server. |
+| `SERVER_KILL_PROCESSES` | `false` | Soft-stop `SERVER_PROCESS` (and related runners) after unload when a non-desktop GPU consumer appears. |
+| `SERVER_FORCE_KILL` | `false` | If true with kill enabled, force-kill processes that ignore terminate. Keep `false` on gaming PCs (WDDM). |
+| `SERVER_START_COMMAND` | _(unset)_ | Shell command to restart the LLM after the game exits (e.g. `ollama serve`). Same host constraint as `SERVER_PROCESS`. |
+| `SERVER_PRELOAD_ON_START` | `true` | After restart, preload remembered models while state is `starting` (still 429), then open. |
+| `SERVER_PRELOAD_KEEP_ALIVE` | `24h` | `keep_alive` passed to Ollama when preloading. |
+| `SERVER_PRELOAD_MODEL` | _(unset)_ | Fallback model to preload if none were loaded at drain time. |
 | `PULL_COMMAND` | _(unset)_ | Shell command used to pull a model for non-Ollama backends; `{model}` is substituted. When unset, `/api/pull` is forwarded to the upstream unchanged. |
 | `PULL_HOLD_TIMEOUT_SECS` | `300` | Seconds to hold inference requests waiting for a pull to finish before returning 503 |
 
 Default `IGNORED_GPU_PROCESSES`: `ollama ollama_llama_server llama-server llamafile lmstudio lms koboldcpp cortex-cpp nitro python python3`
 
-Add your server's process name if it isn't there. For Docker-based Ollama, add `docker dockerd com.docker.backend`. Games (`cs2.exe`, `eldenring.exe`, `DaVinciResolve.exe`) should never be in this list — they're the reason the gate exists.
+Add your server's process name if it isn't there. For Docker-based Ollama, add `docker dockerd com.docker.backend`. Games (`cs2.exe`, `eldenring.exe`, `DaVinciResolve.exe`) should never be in this list — they're the reason the gate exists. Idle desktop/launcher processes are handled by `DEFAULT_DESKTOP_GPU_PROCESSES` in `app/windows_gpu.py`, not this variable.
 
-Accepts a JSON array or space-separated string:
+In `.env`, use a JSON array (required — pydantic-settings JSON-decodes list fields before validators run, so space-separated values fail at startup):
 
 ```
-IGNORED_GPU_PROCESSES=ollama llama-server python3
 IGNORED_GPU_PROCESSES=["ollama","llama-server","python3"]
 ```
 
@@ -155,65 +184,66 @@ Forwards any request to the upstream server over `GET`, `POST`, `DELETE`, `HEAD`
 
 - `Host`, `Content-Length`, and `X-Priority` are stripped; all other headers pass through.
 - Requests with `"stream": true` in the JSON body are streamed with no timeout, passing through the upstream's `Content-Type` (`application/x-ndjson` for Ollama native routes, `text/event-stream` for OpenAI-compatible routes).
-- Non-streaming requests use a 120s timeout.
+- Non-streaming requests use a 600s timeout (cold model loads on large GGUFs can exceed 2 minutes).
 - All requests (streaming and non-streaming) are held until any in-progress pull completes (up to `PULL_HOLD_TIMEOUT_SECS`; returns 503 on timeout).
 - When a model switch is detected, all requests are held for `MODEL_LOAD_IMMUNITY_SECS` before being forwarded to give the new model time to load.
 
 ## Gaming PC / Windows native setup
 
-For a gaming PC, run inference-gate natively alongside your LLM server. The Docker path works for GPU gating but `SERVER_PROCESS` and `SERVER_START_COMMAND` require the proxy to run on the same OS as the LLM server — they use `psutil` to kill and restart host processes, which doesn't work from inside a Docker container on a Windows host.
+Run inference-gate natively alongside Ollama (or another local LLM). Soft-stop and restart use host processes via `psutil` — they only work when the gate shares the OS with the LLM server.
 
 ```bash
-pip install inference-gate   # or: pip install -e . from the repo
+pip install -e .   # from the repo, with venv active
 cp .env.example .env
 # edit .env
-uvicorn app.main:app --port 11435
+uvicorn app.main:app --host 0.0.0.0 --port 11435
 ```
 
-Recommended `.env` for Ollama on Windows:
+Recommended `.env` for Ollama on Windows (see `.env.example` for the full commented set):
 
 ```
 UPSTREAM_URL=http://localhost:11434
-SERVER_PROCESS=ollama
-SERVER_START_COMMAND=ollama serve
 EXTERNAL_VRAM_THRESHOLD_MB=2000
+EXTERNAL_UTIL_FALLBACK_THRESHOLD=40
+SERVER_RESTART_STABLE_SECS=5
+IGNORED_GPU_PROCESSES=["ollama","ollama_llama_server","llama-server"]
+SERVER_PROCESS=ollama
+SERVER_KILL_PROCESSES=true
+SERVER_FORCE_KILL=false
+SERVER_START_COMMAND=ollama serve
+SERVER_PRELOAD_ON_START=true
+SERVER_PRELOAD_KEEP_ALIVE=24h
+PROXY_PORT=11435
 ```
 
-Run `setup-windows.ps1` once as Administrator to disable GPU hardware acceleration in browsers and Discord, reducing idle VRAM usage and letting you set a lower threshold.
+Point clients at `:11435`, not Ollama’s `:11434`.
 
-To run as a background service, use [NSSM](https://nssm.cc/) or register a scheduled task that starts `uvicorn app.main:app --port 11435` at login.
+Run `setup-windows.ps1` once as Administrator to disable GPU hardware acceleration in browsers and Discord, reducing idle VRAM usage.
 
-## Deployment (Docker / Linux server)
+Desktop launchers that still appear on the GPU (Epic, EA, Battle.net, Signal, Razer, …) are allowlisted so they do not drain Ollama — but trimming their “start with Windows” entries under `HKCU\...\Run` still helps boot noise and avoids races before the allowlist is loaded. If a new tray app falsely keeps the gate `down`, add its process name to `DEFAULT_DESKTOP_GPU_PROCESSES` in `app/windows_gpu.py` and restart the gate.
 
-inference-gate needs GPU device access to read NVML via `gpustat` — not to run inference.
+### Survive reboot (Windows)
 
-> **Note:** `SERVER_PROCESS` and `SERVER_START_COMMAND` only work when inference-gate runs natively on the same machine as the LLM server. In Docker these settings have no effect.
+Ollama usually installs a Startup shortcut (`Ollama.lnk`). Register the gate as a logon scheduled task:
 
-```yaml
-services:
-  inference-gate:
-    build: .
-    ports:
-      - "11435:11435"
-    pid: host           # required so gpustat can see host process names
-    environment:
-      - UPSTREAM_URL=http://llm-server:11434   # replace with your LLM server's service name / address
-      - HIGH_PRIORITY_UTIL_THRESHOLD=80
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=utility,compute
-    # depends_on:
-    #   - llm-server   # uncomment and set to your LLM service name if it runs in the same compose file
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
+```powershell
+cd d:\Code\inference-gate
+.\scripts\register-autostart.ps1
+# optional: start without rebooting
+Start-ScheduledTask -TaskName InferenceGate
 ```
 
-If `gpustat` can't reach a GPU (no NVIDIA runtime, dev laptop), it logs a warning and reports the GPU as free. The proxy never blocks in that state. Check `/gpu` after deploying to confirm real numbers.
+That runs `scripts/start-gate.ps1` at logon (30s delay, waits up to ~90s for Ollama, logs under `logs\`). Remove with `.\scripts\unregister-autostart.ps1`.
+
+GPU counters and the Ollama tray need an interactive session. For an unattended gaming PC, enable auto-login (Sysinternals Autologon — account password, not PIN):
+
+```powershell
+.\scripts\enable-autologon.ps1
+```
+
+Anyone with physical access can then use the PC without signing in. Disable later via Autologon → Disable.
+
+If you still prefer NSSM: point it at `.venv\Scripts\uvicorn.exe` with arguments `app.main:app --host 0.0.0.0 --port 11435` and working directory set to the repo root.
 
 ## Development
 
@@ -223,7 +253,16 @@ pip install -e '.[dev]'
 pytest
 ```
 
-Tests stub `app.state.gpu_query` with fixed `GpuState` values and mock the upstream with `respx` — no GPU or LLM server needed.
+Unit tests stub `app.state.gpu_query` with fixed `GpuState` values and mock the upstream with `respx` — no GPU or LLM server needed.
+
+Live smoke (requires gate + Ollama running):
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 11435
+pytest tests/test_smoke.py -v
+# optional overrides:
+# INFERENCE_GATE_URL=http://192.168.0.253:11435 INFERENCE_GATE_SMOKE_MODEL=gemma4:12b-it-q4_K_M pytest tests/test_smoke.py
+```
 
 ```bash
 uvicorn app.main:app --reload --port 11435

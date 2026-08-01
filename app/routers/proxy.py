@@ -8,7 +8,13 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from ..priority import Priority, get_priority, should_allow
+from ..priority import (
+    Priority,
+    external_vram_mb,
+    get_priority,
+    is_effectively_free,
+    should_allow,
+)
 from ..server import ServerManager
 
 router = APIRouter()
@@ -97,7 +103,17 @@ async def _forward(request: Request, method: str, path: str, body: bytes | None)
 
         return StreamingResponse(_stream_with_cleanup(), media_type=content_type)
 
-    upstream = await client.request(method, url, content=body, headers=headers)
+    try:
+        upstream = await client.request(method, url, content=body, headers=headers)
+    except httpx.TimeoutException:
+        return JSONResponse(
+            status_code=504,
+            content={"error": "upstream timed out waiting for LLM server"},
+        )
+    except httpx.ConnectError:
+        # Upstream may have been stopped to free the GPU — caller maps this to 429
+        # when the gate is draining/down or the GPU is busy.
+        raise
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
@@ -109,7 +125,8 @@ def _check_model_change(request: Request, body: bytes, priority: Priority) -> JS
     """On a model switch, hold subsequent requests until the load window expires.
 
     Low-priority requests are rejected with 429 rather than triggering a model load —
-    they run on whatever model is already loaded or not at all.
+    they run on whatever model is already loaded or not at all. The first request
+    (last_model is None) is allowed for every priority so cold start works.
     """
     try:
         parsed = json.loads(body)
@@ -119,6 +136,9 @@ def _check_model_change(request: Request, body: bytes, priority: Priority) -> JS
     if not model or model == request.app.state.last_model:
         return None
     prev = request.app.state.last_model
+    if prev is None:
+        request.app.state.last_model = model
+        return None  # first request — no load window needed
     if priority == Priority.LOW:
         return JSONResponse(
             status_code=429,
@@ -126,8 +146,6 @@ def _check_model_change(request: Request, body: bytes, priority: Priority) -> JS
             headers={"Retry-After": RETRY_AFTER},
         )
     request.app.state.last_model = model
-    if prev is None:
-        return None  # first request — no load needed
     secs = request.app.state.settings.model_load_immunity_secs
     model_ready: asyncio.Event = request.app.state.model_ready
     old_task = request.app.state._release_task
@@ -146,9 +164,13 @@ async def _release_after(event: asyncio.Event, secs: float) -> None:
 def _gate_status_response(manager: ServerManager, gpu, settings) -> Response:
     """HEAD preflight: returns gate status without forwarding or counting as in-flight."""
     server = manager.to_dict()
-    total_external_mb = sum(p.get("mem_mb", 0) for p in gpu.external_consumers)
+    total_external_mb = external_vram_mb(gpu)
     accepting = manager.accepting()
-    gpu_free = total_external_mb <= settings.external_vram_threshold_mb
+    gpu_free = is_effectively_free(
+        gpu,
+        settings.external_vram_threshold_mb,
+        settings.external_util_fallback_threshold,
+    )
     status = 200 if accepting and gpu_free else 429
     return Response(
         status_code=status,
@@ -172,7 +194,7 @@ async def proxy(request: Request, path: str) -> Response:
         gpu = await request.app.state.gpu_query()
         return _gate_status_response(manager, gpu, settings)
 
-    # Server draining or down — 429 everything
+    # Server draining or down — gate stays up and 429s (Ollama may be killed).
     if not await manager.acquire():
         return _make_429()
 
@@ -202,9 +224,24 @@ async def proxy(request: Request, path: str) -> Response:
             gpu,
             settings.high_priority_util_threshold,
             settings.external_vram_threshold_mb,
+            settings.external_util_fallback_threshold,
         ):
             return _make_429()
 
-        return await _forward(request, request.method, f"/{path}", body or None)
+        try:
+            return await _forward(request, request.method, f"/{path}", body or None)
+        except httpx.ConnectError:
+            # Race: Ollama killed for a game while this request was mid-flight.
+            # Prefer 429 so clients back off instead of treating the gate as dead.
+            if not manager.accepting() or not is_effectively_free(
+                gpu,
+                settings.external_vram_threshold_mb,
+                settings.external_util_fallback_threshold,
+            ):
+                return _make_429()
+            return JSONResponse(
+                status_code=502,
+                content={"error": "upstream unreachable"},
+            )
     finally:
         await manager.release()

@@ -40,11 +40,12 @@ def setup_settings():
 async def _setup_async_state(gpu: GpuState = FREE_GPU):
     """Replicate what lifespan does so async tests don't need to enter it."""
     from app.config import get_settings
+    from app.server import ServerManager
 
     get_settings.cache_clear()
     settings = get_settings()
     app.state.settings = settings
-    app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0))
+    app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=5.0))
     app.state.gpu_query = _async_gpu(gpu)
     app.state.last_model = None
     app.state.pull_ready = asyncio.Event()
@@ -52,6 +53,7 @@ async def _setup_async_state(gpu: GpuState = FREE_GPU):
     app.state.model_ready = asyncio.Event()
     app.state.model_ready.set()
     app.state._release_task = None
+    app.state.server_manager = ServerManager(settings)
 
 
 async def _teardown_async_state():
@@ -357,3 +359,121 @@ def test_streaming_request_proxied_correctly():
     assert r.status_code == 200
     assert "ndjson" in r.headers.get("content-type", "")
     assert b"hello" in r.content
+
+
+async def test_low_priority_first_request_allowed():
+    """Cold start: low priority must be allowed when no model is loaded yet."""
+    await _setup_async_state()
+    try:
+        app.state.last_model = None
+        with respx.mock:
+            respx.post("http://localhost:11434/api/generate").mock(
+                return_value=httpx.Response(200, json={"response": "ok"})
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                r = await client.post(
+                    "/api/generate",
+                    headers={"X-Priority": "low"},
+                    json={"model": "gemma4:12b", "prompt": "hi"},
+                )
+        assert r.status_code == 200
+        assert app.state.last_model == "gemma4:12b"
+    finally:
+        await _teardown_async_state()
+
+
+async def test_low_priority_model_switch_rejected():
+    """Low priority cannot switch away from an already-loaded model."""
+    await _setup_async_state()
+    try:
+        app.state.last_model = "model-a"
+        with respx.mock:
+            respx.post("http://localhost:11434/api/generate").mock(
+                return_value=httpx.Response(200, json={"response": "ok"})
+            )
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                r = await client.post(
+                    "/api/generate",
+                    headers={"X-Priority": "low"},
+                    json={"model": "model-b", "prompt": "hi"},
+                )
+        assert r.status_code == 429
+        assert "cannot switch" in r.json()["error"]
+    finally:
+        await _teardown_async_state()
+
+
+async def test_upstream_timeout_returns_504():
+    """ReadTimeout from upstream must become 504, not an unhandled 500."""
+    await _setup_async_state()
+    try:
+
+        async def _timeout(*_args, **_kwargs):
+            raise httpx.ReadTimeout("slow")
+
+        with patch.object(app.state.http_client, "request", side_effect=_timeout):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                r = await client.post(
+                    "/api/generate",
+                    json={"model": "gemma4:12b", "prompt": "hi", "stream": False},
+                )
+        assert r.status_code == 504
+    finally:
+        await _teardown_async_state()
+
+
+async def test_down_state_returns_429_including_realtime():
+    """Killing Ollama must not break the gate — clients still get 429."""
+    from app.server import ServerState
+
+    await _setup_async_state()
+    try:
+        app.state.server_manager._state = ServerState.DOWN
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            r = await client.post(
+                "/api/generate",
+                headers={"X-Priority": "realtime"},
+                json={"model": "gemma4:12b", "prompt": "hi"},
+            )
+            head = await client.head("/api/generate")
+        assert r.status_code == 429
+        assert r.json()["error"]
+        assert "Retry-After" in r.headers
+        assert head.status_code == 429
+    finally:
+        await _teardown_async_state()
+
+
+async def test_connect_error_while_busy_returns_429():
+    """If Ollama is killed mid-request while GPU is busy, return 429 not 500."""
+    await _setup_async_state(BUSY_GPU)
+    try:
+
+        async def _connect_fail(*_args, **_kwargs):
+            raise httpx.ConnectError("ollama gone")
+
+        with patch.object(app.state.http_client, "request", side_effect=_connect_fail):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                r = await client.post(
+                    "/api/generate",
+                    headers={"X-Priority": "realtime"},
+                    json={"model": "gemma4:12b", "prompt": "hi", "stream": False},
+                )
+        assert r.status_code == 429
+    finally:
+        await _teardown_async_state()

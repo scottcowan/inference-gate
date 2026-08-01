@@ -12,8 +12,8 @@ class Settings(BaseSettings):
 
     # LLM server process names that are expected GPU consumers — never trigger backoff.
     # These are inference server binary/script names, NOT game names.
-    # Env var accepts JSON array or space-separated string:
-    #   IGNORED_GPU_PROCESSES='["ollama","game.exe"]'  or  IGNORED_GPU_PROCESSES="ollama game.exe"
+    # In .env this must be a JSON array (pydantic-settings JSON-decodes list fields first):
+    #   IGNORED_GPU_PROCESSES=["ollama","ollama_llama_server","llama-server"]
     ignored_gpu_processes: list[str] = [
         # Ollama native
         "ollama",
@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     # that always hold a small amount of VRAM. Default 500 MB.
     external_vram_threshold_mb: int = 500
 
+    # When per-process VRAM is unavailable (common on Windows — every mem_mb is 0), treat the
+    # GPU as busy if a non-desktop process is on the GPU, or if utilization exceeds this percent.
+    # Default 40 (util is a secondary signal; process presence is primary on WDDM).
+    external_util_fallback_threshold: int = 40
+
+    # Consecutive free polls required before restarting the LLM server after a drain.
+    # Prevents util-dip thrashing while a game is still loading.
+    server_restart_stable_secs: int = 5
+
     # seconds to treat GPU as free after a model change is detected
     model_load_immunity_secs: int = 60
 
@@ -56,14 +65,36 @@ class Settings(BaseSettings):
     # before giving up with a 503
     pull_hold_timeout_secs: int = 300
 
-    # Process name to kill when GPU pressure is detected (e.g. "ollama", "llama-server").
-    # When unset, the server is marked down without killing anything.
+    # Process name stopped after unload when SERVER_KILL_PROCESSES=true (e.g. "ollama").
+    # Matches "stop the Ollama container" — unload alone often leaves CUDA/driver state
+    # that exclusive-fullscreen games dislike even when nvidia-smi looks free.
     server_process: str | None = None
 
-    # Shell command to restart the LLM server after a game exits.
-    # When unset, the server stays down until manually restarted.
+    # If true, stop SERVER_PROCESS (and related runners) after unloading models.
+    # Prefer soft terminate (SERVER_FORCE_KILL=false). Hard-killing CUDA runners mid-frame
+    # on Windows WDDM can TDR and take Steam/games/Elgato with them.
+    server_kill_processes: bool = False
+
+    # If true with SERVER_KILL_PROCESSES, force-kill processes that ignore terminate.
+    # Default false — safer on gaming PCs after a successful model unload.
+    server_force_kill: bool = False
+
+    # Shell command to restart the LLM server after a game exits (only if stop was enabled).
+    # Long-running commands like `ollama serve` are spawned in the background; the gate
+    # waits for UPSTREAM_URL /api/tags to become healthy, then optionally preloads models
+    # while still returning 429 (STARTING), then flips to RUNNING.
     # e.g. "ollama serve" or "llama-server --model /models/qwen2.5-7b.gguf"
     server_start_command: str | None = None
+
+    # After restarting the LLM server, preload remembered models (from /api/ps at drain)
+    # before clearing 429 / entering RUNNING.
+    server_preload_on_start: bool = True
+
+    # keep_alive passed when preloading (Ollama duration string or seconds).
+    server_preload_keep_alive: str = "24h"
+
+    # Fallback model to preload if none were loaded at drain time.
+    server_preload_model: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 

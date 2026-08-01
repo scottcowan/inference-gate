@@ -51,7 +51,7 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     app.state.settings = settings
     app.state.gpu_query = _make_gpu_query(settings)
-    app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0))
+    app.state.http_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=5.0))
     app.state.last_model = None
     app.state.pull_ready = asyncio.Event()
     app.state.pull_ready.set()  # starts ready — not pulling
@@ -62,6 +62,7 @@ async def lifespan(app: FastAPI):
     watcher = asyncio.create_task(watch_gpu(app))
     logger.info("inference-gate starting — upstream: %s", settings.upstream_url)
     yield
+    logger.info("inference-gate shutting down")
     watcher.cancel()
     try:
         await watcher

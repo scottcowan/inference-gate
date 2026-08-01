@@ -26,11 +26,11 @@ def _patched_query(processes, ignored):
 
 
 def test_external_process_detected():
-    """game.exe should appear as an external consumer."""
+    """game.exe should appear as an external consumer (normalized without .exe)."""
     proc = {"command": "game.exe", "gpu_memory_usage": 8000, "username": "user"}
     state = _patched_query([proc], ["docker", "ollama"])
     assert len(state.external_consumers) == 1
-    assert state.external_consumers[0]["name"] == "game.exe"
+    assert state.external_consumers[0]["name"] == "game"
     assert not state.free
 
 
@@ -42,11 +42,19 @@ def test_ignored_process_excluded():
     assert state.free
 
 
+def test_ignored_exe_suffix_matched():
+    """llama-server.exe must match ignored entry 'llama-server'."""
+    proc = {"command": r"C:\Ollama\llama-server.exe", "gpu_memory_usage": 4000, "username": "u"}
+    state = _patched_query([proc], ["llama-server", "ollama"])
+    assert state.external_consumers == []
+    assert state.free
+
+
 def test_full_path_stripped():
-    """/usr/bin/game.exe → game.exe for matching."""
+    """/usr/bin/game.exe → game for matching."""
     proc = {"command": "/usr/bin/game.exe", "gpu_memory_usage": 500, "username": "u"}
     state = _patched_query([proc], [])
-    assert state.external_consumers[0]["name"] == "game.exe"
+    assert state.external_consumers[0]["name"] == "game"
 
 
 def test_missing_command_key_falls_back_to_username():
@@ -54,6 +62,13 @@ def test_missing_command_key_falls_back_to_username():
     proc = {"gpu_memory_usage": 200, "username": "someuser"}
     state = _patched_query([proc], ["docker"])
     assert state.external_consumers[0]["name"] == "someuser"
+
+
+def test_none_gpu_memory_usage_coerced_to_zero():
+    """gpustat on Windows can return gpu_memory_usage=None — treat as 0."""
+    proc = {"command": "dwm.exe", "gpu_memory_usage": None, "username": "user"}
+    state = _patched_query([proc], [])
+    assert state.external_consumers[0]["mem_mb"] == 0
 
 
 def test_gpustat_failure_reports_free():

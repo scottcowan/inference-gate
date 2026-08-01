@@ -1,4 +1,5 @@
 import logging
+import sys
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,35 @@ class GpuState:
         }
 
 
+def _normalize_process_name(raw: str) -> str:
+    """Basename, lowercased, without .exe — matches Windows gpustat / ignored list entries."""
+    name = raw.split("/")[-1].split("\\")[-1].lower()
+    return name.removesuffix(".exe")
+
+
+def _enrich_mem_from_pdh(external: list[dict]) -> None:
+    """Overlay Windows PDH dedicated VRAM onto consumers (mutates in place)."""
+    if sys.platform != "win32" or not external:
+        return
+    try:
+        from .pdh_vram import dedicated_mb_by_pid
+
+        by_pid = dedicated_mb_by_pid()
+    except Exception:
+        logger.warning("PDH VRAM enrich skipped", exc_info=True)
+        return
+    if not by_pid:
+        return
+    for p in external:
+        pid = p.get("pid")
+        if pid is None:
+            continue
+        mb = by_pid.get(int(pid))
+        if mb is not None and mb > 0:
+            p["mem_mb"] = int(round(mb))
+            p["mem_source"] = "pdh"
+
+
 def query_gpu(ignored_processes: list[str]) -> GpuState:
     try:
         from gpustat import GPUStatCollection
@@ -31,13 +61,30 @@ def query_gpu(ignored_processes: list[str]) -> GpuState:
         stats = GPUStatCollection.new_query()
         gpu = stats[0]
 
-        ignored = {p.lower() for p in ignored_processes}
+        ignored = {_normalize_process_name(p) for p in ignored_processes}
         external = []
         for p in gpu.processes:
             raw = p.get("command") or p.get("full_command") or p.get("username") or ""
-            name = raw.split("/")[-1].split("\\")[-1].lower()
+            name = _normalize_process_name(raw)
+            pid = p.get("pid")
+            # gpustat sometimes yields "?" on Windows — resolve via pid when possible
+            if (not name or name == "?") and pid:
+                try:
+                    import psutil
+
+                    name = _normalize_process_name(psutil.Process(int(pid)).name())
+                except Exception:
+                    name = name or "?"
             if name not in ignored:
-                external.append({"name": name, "mem_mb": p.get("gpu_memory_usage", 0)})
+                # gpustat may report gpu_memory_usage as None on Windows/NVML
+                entry = {
+                    "name": name,
+                    "mem_mb": p.get("gpu_memory_usage") or 0,
+                    "pid": pid,
+                }
+                external.append(entry)
+
+        _enrich_mem_from_pdh(external)
 
         mem_total = gpu.memory_total or 1
         return GpuState(
