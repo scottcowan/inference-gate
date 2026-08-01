@@ -73,6 +73,8 @@ DEFAULT_DESKTOP_GPU_PROCESSES: frozenset[str] = frozenset(
         "procexp64",
         "perfmon",
         "resmon",
+        "securityhealthsystray",
+        "sechealthui",
         "unigetui.avalonia",
         "cefviewwing",
         "lm studio",
